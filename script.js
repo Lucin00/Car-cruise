@@ -8,16 +8,18 @@ renderer.setSize(window.innerWidth, window.innerHeight);
 renderer.shadowMap.enabled = true;
 
 const scene = new THREE.Scene();
-const camera = new THREE.PerspectiveCamera(60, window.innerWidth / window.innerHeight, 0.1, 2000);
+const BASE_FOV = 58;
+const camera = new THREE.PerspectiveCamera(BASE_FOV, window.innerWidth / window.innerHeight, 0.1, 2000);
 
-const fog = new THREE.Fog(0x9fd8ff, 60, 400);
+const fog = new THREE.Fog(0x9fd8ff, 50, 480);
 scene.fog = fog;
 
-const ambient = new THREE.AmbientLight(0xffffff, 0.6);
-scene.add(ambient);
+const hemi = new THREE.HemisphereLight(0x9fd8ff, 0x4a8f4a, 0.7);
+scene.add(hemi);
 
 const sun = new THREE.DirectionalLight(0xffffff, 1);
-sun.position.set(-50, 80, -30);
+const SUN_OFFSET = new THREE.Vector3(-50, 80, -30);
+sun.position.copy(SUN_OFFSET);
 sun.castShadow = true;
 sun.shadow.mapSize.set(2048, 2048);
 sun.shadow.camera.left = -100;
@@ -25,22 +27,7 @@ sun.shadow.camera.right = 100;
 sun.shadow.camera.top = 100;
 sun.shadow.camera.bottom = -100;
 scene.add(sun);
-
-// ---------- time-of-day presets (lighting only) ----------
-const timePresets = {
-  day:    { sky: 0x9fd8ff, fog: 0x9fd8ff, ambient: 0.6, sun: 1.0, sunColor: 0xffffff },
-  sunset: { sky: 0xff9a5c, fog: 0xffb28a, ambient: 0.4, sun: 1.1, sunColor: 0xffcf9e },
-  night:  { sky: 0x0a1029, fog: 0x0a1029, ambient: 0.15, sun: 0.2, sunColor: 0x88a2ff },
-};
-
-function applyPreset(name) {
-  const p = timePresets[name];
-  scene.background = new THREE.Color(p.sky);
-  fog.color = new THREE.Color(p.fog);
-  ambient.intensity = p.ambient;
-  sun.intensity = p.sun;
-  sun.color = new THREE.Color(p.sunColor);
-}
+scene.add(sun.target);
 
 // ---------- ground ----------
 const ground = new THREE.Mesh(
@@ -60,20 +47,185 @@ const VEHICLES = {
 };
 
 const MAPS = {
-  hills:  { label: "Coastal Hills", ground: 0x4a8f4a, tree: 0x2f7a3a, curveAmp1: 40, curveAmp2: 10, treeDensity: 6 },
-  desert: { label: "Desert Dunes",  ground: 0xd8b06a, tree: 0x8a9c4c, curveAmp1: 65, curveAmp2: 5,  treeDensity: 2 },
-  snow:   { label: "Snowy Pines",   ground: 0xf3f6fa, tree: 0x274a3a, curveAmp1: 28, curveAmp2: 16, treeDensity: 8 },
-  canyon: { label: "Red Canyon",    ground: 0xb85c3c, tree: 0x6b5636, curveAmp1: 55, curveAmp2: 20, treeDensity: 3 },
+  hills:  { label: "Coastal Hills", ground: 0x4a8f4a, tree: 0x2f7a3a, mountainColor: 0x3c6b52, shoulder: 0x5c4a32, rock: 0x8a8a8a, curveAmp1: 40, curveAmp2: 10, treeDensity: 9 },
+  desert: { label: "Desert Dunes",  ground: 0xd8b06a, tree: 0x8a9c4c, mountainColor: 0xc98a52, shoulder: 0xc2986a, rock: 0xb98a55, curveAmp1: 65, curveAmp2: 5,  treeDensity: 4 },
+  snow:   { label: "Snowy Pines",   ground: 0xf3f6fa, tree: 0x274a3a, mountainColor: 0x8fa9c9, shoulder: 0xc9d3da, rock: 0xaab4bd, curveAmp1: 28, curveAmp2: 16, treeDensity: 12 },
+  canyon: { label: "Red Canyon",    ground: 0xb85c3c, tree: 0x6b5636, mountainColor: 0x8a4a35, shoulder: 0x8f5236, rock: 0x7a4636, curveAmp1: 55, curveAmp2: 20, treeDensity: 5 },
 };
 
 let currentMap = MAPS.hills;
 
+// ---------- atmosphere & sky ----------
+function makeGlowTexture() {
+  const size = 256;
+  const c = document.createElement("canvas");
+  c.width = c.height = size;
+  const ctx = c.getContext("2d");
+  const g = ctx.createRadialGradient(size / 2, size / 2, 0, size / 2, size / 2, size / 2);
+  g.addColorStop(0, "rgba(255,255,255,1)");
+  g.addColorStop(0.4, "rgba(255,255,255,0.55)");
+  g.addColorStop(1, "rgba(255,255,255,0)");
+  ctx.fillStyle = g;
+  ctx.fillRect(0, 0, size, size);
+  return new THREE.CanvasTexture(c);
+}
+
+function makeSkyDome() {
+  const geo = new THREE.SphereGeometry(900, 32, 16);
+  const count = geo.attributes.position.count;
+  geo.setAttribute("color", new THREE.Float32BufferAttribute(new Float32Array(count * 3), 3));
+  const mat = new THREE.MeshBasicMaterial({ vertexColors: true, side: THREE.BackSide, fog: false, depthWrite: false });
+  const mesh = new THREE.Mesh(geo, mat);
+  mesh.renderOrder = -10;
+  return mesh;
+}
+
+function updateSkyGradient(horizonHex, zenithHex) {
+  const horizon = new THREE.Color(horizonHex);
+  const zenith = new THREE.Color(zenithHex);
+  const pos = skyDome.geometry.attributes.position;
+  const colorAttr = skyDome.geometry.attributes.color;
+  const c = new THREE.Color();
+  for (let i = 0; i < pos.count; i++) {
+    const t = THREE.MathUtils.clamp((pos.getY(i) + 120) / 900, 0, 1);
+    c.lerpColors(horizon, zenith, t);
+    colorAttr.setXYZ(i, c.r, c.g, c.b);
+  }
+  colorAttr.needsUpdate = true;
+  scene.background = horizon;
+}
+
+function makeStars() {
+  const count = 600;
+  const positions = new Float32Array(count * 3);
+  for (let i = 0; i < count; i++) {
+    const theta = Math.random() * Math.PI * 2;
+    const phi = Math.random() * Math.PI * 0.5;
+    const r = 850;
+    positions[i * 3] = r * Math.sin(phi) * Math.cos(theta);
+    positions[i * 3 + 1] = r * Math.cos(phi);
+    positions[i * 3 + 2] = r * Math.sin(phi) * Math.sin(theta);
+  }
+  const geo = new THREE.BufferGeometry();
+  geo.setAttribute("position", new THREE.Float32BufferAttribute(positions, 3));
+  const mat = new THREE.PointsMaterial({ color: 0xffffff, size: 2.2, sizeAttenuation: false, transparent: true, opacity: 0.85, fog: false });
+  const pts = new THREE.Points(geo, mat);
+  pts.visible = false;
+  return pts;
+}
+
+function makeMountainRing(material) {
+  const group = new THREE.Group();
+  const count = 22;
+  const baseRadius = 240;
+  for (let i = 0; i < count; i++) {
+    const angle = (i / count) * Math.PI * 2 + Math.random() * 0.15;
+    const h = 50 + Math.random() * 90;
+    const r = 35 + Math.random() * 45;
+    const cone = new THREE.Mesh(new THREE.ConeGeometry(r, h, 5), material);
+    const dist = baseRadius + Math.random() * 40;
+    cone.position.set(Math.cos(angle) * dist, h / 2 - 6, Math.sin(angle) * dist);
+    cone.rotation.y = Math.random() * Math.PI;
+    group.add(cone);
+  }
+  return group;
+}
+
+const atmosphere = new THREE.Group();
+scene.add(atmosphere);
+
+const skyDome = makeSkyDome();
+atmosphere.add(skyDome);
+
+const stars = makeStars();
+atmosphere.add(stars);
+
+const glowTexture = makeGlowTexture();
+const sunSprite = new THREE.Sprite(new THREE.SpriteMaterial({
+  map: glowTexture, color: 0xfff6df, transparent: true, blending: THREE.AdditiveBlending, depthWrite: false, fog: false,
+}));
+const SUN_DIR = SUN_OFFSET.clone().normalize();
+sunSprite.position.copy(SUN_DIR).multiplyScalar(650);
+sunSprite.scale.set(130, 130, 1);
+atmosphere.add(sunSprite);
+
+const mountainMat = new THREE.MeshBasicMaterial({ color: currentMap.mountainColor });
+const mountains = makeMountainRing(mountainMat);
+atmosphere.add(mountains);
+
+const CLOUD_COUNT = 16;
+const clouds = [];
+for (let i = 0; i < CLOUD_COUNT; i++) {
+  const mat = new THREE.SpriteMaterial({ map: glowTexture, color: 0xffffff, transparent: true, opacity: 0.85, depthWrite: false, fog: false });
+  const sprite = new THREE.Sprite(mat);
+  const scale = 60 + Math.random() * 70;
+  sprite.scale.set(scale, scale * 0.45, 1);
+  const angle = Math.random() * Math.PI * 2;
+  const dist = 90 + Math.random() * 200;
+  sprite.position.set(Math.cos(angle) * dist, 90 + Math.random() * 40, Math.sin(angle) * dist);
+  sprite.userData.drift = (Math.random() - 0.5) * 3.5;
+  atmosphere.add(sprite);
+  clouds.push(sprite);
+}
+
+// ---------- time-of-day presets ----------
+const timePresets = {
+  day: {
+    fog: 0x9fd8ff, skyHorizon: 0xbfe4ff, skyZenith: 0x1e6fd9,
+    hemiSky: 0x9fd8ff, hemiIntensity: 0.75, sun: 1.05, sunColor: 0xffffff,
+    sunVisualColor: 0xfff6df, sunVisualScale: 130,
+    cloudColor: 0xffffff, cloudOpacity: 0.85,
+    headlight: 0, starsVisible: false,
+  },
+  sunset: {
+    fog: 0xffb28a, skyHorizon: 0xffb073, skyZenith: 0x3c2f63,
+    hemiSky: 0xffb073, hemiIntensity: 0.55, sun: 1.15, sunColor: 0xffcf9e,
+    sunVisualColor: 0xff9a5c, sunVisualScale: 170,
+    cloudColor: 0xffcaa0, cloudOpacity: 0.8,
+    headlight: 0.5, starsVisible: false,
+  },
+  night: {
+    fog: 0x0a1029, skyHorizon: 0x141b3d, skyZenith: 0x02040c,
+    hemiSky: 0x223159, hemiIntensity: 0.25, sun: 0.15, sunColor: 0x88a2ff,
+    sunVisualColor: 0xcfd8ff, sunVisualScale: 70,
+    cloudColor: 0x333a5c, cloudOpacity: 0.4,
+    headlight: 1.3, starsVisible: true,
+  },
+};
+
+function applyPreset(name) {
+  const p = timePresets[name];
+  fog.color.set(p.fog);
+  hemi.color.set(p.hemiSky);
+  hemi.intensity = p.hemiIntensity;
+  sun.intensity = p.sun;
+  sun.color.set(p.sunColor);
+  sunSprite.material.color.set(p.sunVisualColor);
+  sunSprite.scale.set(p.sunVisualScale, p.sunVisualScale, 1);
+  clouds.forEach((c) => {
+    c.material.color.set(p.cloudColor);
+    c.material.opacity = p.cloudOpacity;
+  });
+  headlight.intensity = p.headlight;
+  reflectorMat.emissiveIntensity = p.headlight > 0 ? 1.1 : 0.15;
+  stars.visible = p.starsVisible;
+  updateSkyGradient(p.skyHorizon, p.skyZenith);
+}
+
 // ---------- procedural road ----------
 const ROAD_WIDTH = 12;
+const SHOULDER_WIDTH = 3.5; // gap strip between the asphalt and the roadside content
 const CHUNK_LENGTH = 40;
 const CHUNKS_AHEAD = 14;
-const roadMat = new THREE.MeshStandardMaterial({ color: 0x2b2b30 });
+
+const roadMat = new THREE.MeshStandardMaterial({ color: 0x141414, roughness: 0.92, metalness: 0.05 });
+const sheenMat = new THREE.MeshStandardMaterial({ color: 0x1c1c1c, roughness: 0.3, metalness: 0.2 });
 const lineMat = new THREE.MeshStandardMaterial({ color: 0xf2f2f2 });
+const shoulderMat = new THREE.MeshStandardMaterial({ color: 0x5c4a32, roughness: 1 });
+const bushMat = new THREE.MeshStandardMaterial({ color: 0x2f7a3a, roughness: 0.9 });
+const rockMat = new THREE.MeshStandardMaterial({ color: 0x8a8a8a, roughness: 1 });
+const postMat = new THREE.MeshStandardMaterial({ color: 0xe8e8e8, roughness: 0.6 });
+const reflectorMat = new THREE.MeshStandardMaterial({ color: 0xff8a3d, emissive: 0xff8a3d, emissiveIntensity: 0.15 });
 
 function roadCurveX(z) {
   return Math.sin(z * 0.0025) * currentMap.curveAmp1 + Math.sin(z * 0.008) * currentMap.curveAmp2;
@@ -84,6 +236,26 @@ function roadHeadingAt(z) {
   const x1 = roadCurveX(z);
   const x2 = roadCurveX(z + delta);
   return Math.atan2(x2 - x1, delta);
+}
+
+function buildRibbon(zStart, widthFn, material, yOffset) {
+  const segments = 8;
+  const positions = [];
+  const indices = [];
+  for (let i = 0; i <= segments; i++) {
+    const z = zStart + (i / segments) * CHUNK_LENGTH;
+    const [cx, w] = widthFn(z);
+    positions.push(cx - w / 2, yOffset, z, cx + w / 2, yOffset, z);
+  }
+  for (let i = 0; i < segments; i++) {
+    const a = i * 2, b = i * 2 + 1, c = i * 2 + 2, d = i * 2 + 3;
+    indices.push(a, b, c, b, d, c);
+  }
+  const geo = new THREE.BufferGeometry();
+  geo.setAttribute("position", new THREE.Float32BufferAttribute(positions, 3));
+  geo.setIndex(indices);
+  geo.computeVertexNormals();
+  return new THREE.Mesh(geo, material);
 }
 
 function makeTree() {
@@ -105,29 +277,55 @@ function makeTree() {
   return g;
 }
 
+function makeBush() {
+  const g = new THREE.Group();
+  const clusters = 3 + Math.floor(Math.random() * 2);
+  for (let i = 0; i < clusters; i++) {
+    const r = 0.4 + Math.random() * 0.35;
+    const sphere = new THREE.Mesh(new THREE.SphereGeometry(r, 6, 5), bushMat);
+    sphere.position.set((Math.random() - 0.5) * 0.7, r * 0.75, (Math.random() - 0.5) * 0.7);
+    sphere.castShadow = true;
+    g.add(sphere);
+  }
+  return g;
+}
+
+function makeRock() {
+  const rock = new THREE.Mesh(new THREE.DodecahedronGeometry(0.35 + Math.random() * 0.5, 0), rockMat);
+  rock.rotation.set(Math.random() * Math.PI, Math.random() * Math.PI, Math.random() * Math.PI);
+  rock.castShadow = true;
+  rock.receiveShadow = true;
+  return rock;
+}
+
+function makeGuidePost() {
+  const g = new THREE.Group();
+  const post = new THREE.Mesh(new THREE.CylinderGeometry(0.05, 0.05, 1, 6), postMat);
+  post.position.y = 0.5;
+  post.castShadow = true;
+  const cap = new THREE.Mesh(new THREE.BoxGeometry(0.12, 0.22, 0.04), reflectorMat);
+  cap.position.y = 0.95;
+  g.add(post, cap);
+  return g;
+}
+
 function buildChunk(index) {
   const zStart = index * CHUNK_LENGTH;
-  const segments = 8;
-  const positions = [];
-  const indices = [];
-  for (let i = 0; i <= segments; i++) {
-    const z = zStart + (i / segments) * CHUNK_LENGTH;
-    const cx = roadCurveX(z);
-    positions.push(cx - ROAD_WIDTH / 2, 0.01, z, cx + ROAD_WIDTH / 2, 0.01, z);
-  }
-  for (let i = 0; i < segments; i++) {
-    const a = i * 2, b = i * 2 + 1, c = i * 2 + 2, d = i * 2 + 3;
-    indices.push(a, b, c, b, d, c);
-  }
-  const geo = new THREE.BufferGeometry();
-  geo.setAttribute("position", new THREE.Float32BufferAttribute(positions, 3));
-  geo.setIndex(indices);
-  geo.computeVertexNormals();
-  const roadMesh = new THREE.Mesh(geo, roadMat);
+
+  const roadMesh = buildRibbon(zStart, (z) => [roadCurveX(z), ROAD_WIDTH], roadMat, 0.01);
   roadMesh.receiveShadow = true;
   scene.add(roadMesh);
 
+  const sheen = buildRibbon(zStart, (z) => [roadCurveX(z), 2.2], sheenMat, 0.015);
+  scene.add(sheen);
+
+  const edgeInset = ROAD_WIDTH / 2 - 0.18;
+  const leftEdge = buildRibbon(zStart, (z) => [roadCurveX(z) - edgeInset, 0.28], lineMat, 0.02);
+  const rightEdge = buildRibbon(zStart, (z) => [roadCurveX(z) + edgeInset, 0.28], lineMat, 0.02);
+  scene.add(leftEdge, rightEdge);
+
   const dashGroup = new THREE.Group();
+  const segments = 8;
   for (let i = 0; i < segments; i += 2) {
     const z = zStart + (i / segments) * CHUNK_LENGTH;
     const cx = roadCurveX(z);
@@ -138,19 +336,70 @@ function buildChunk(index) {
   }
   scene.add(dashGroup);
 
+  // shoulder strip: the clear visual gap between the asphalt and the roadside
+  const shoulderOffset = ROAD_WIDTH / 2 + SHOULDER_WIDTH / 2;
+  const leftShoulder = buildRibbon(zStart, (z) => [roadCurveX(z) - shoulderOffset, SHOULDER_WIDTH], shoulderMat, 0.006);
+  const rightShoulder = buildRibbon(zStart, (z) => [roadCurveX(z) + shoulderOffset, SHOULDER_WIDTH], shoulderMat, 0.006);
+  leftShoulder.receiveShadow = true;
+  rightShoulder.receiveShadow = true;
+  scene.add(leftShoulder, rightShoulder);
+
+  // guide posts mark the outer edge of the shoulder, reinforcing the boundary
+  const guidePosts = new THREE.Group();
+  const postOffset = ROAD_WIDTH / 2 + SHOULDER_WIDTH + 0.3;
+  [2, 6].forEach((i) => {
+    const z = zStart + (i / segments) * CHUNK_LENGTH;
+    const cx = roadCurveX(z);
+    [-1, 1].forEach((side) => {
+      const post = makeGuidePost();
+      post.position.set(cx + side * postOffset, 0, z);
+      guidePosts.add(post);
+    });
+  });
+  scene.add(guidePosts);
+
+  // trees, bushes and rocks all start beyond the shoulder for a clean buffer
+  const sideStart = ROAD_WIDTH / 2 + SHOULDER_WIDTH + 1.5;
+
   const trees = new THREE.Group();
   for (let i = 0; i < currentMap.treeDensity; i++) {
     const z = zStart + Math.random() * CHUNK_LENGTH;
     const cx = roadCurveX(z);
     const side = Math.random() < 0.5 ? -1 : 1;
-    const dist = ROAD_WIDTH / 2 + 4 + Math.random() * 20;
+    const dist = sideStart + Math.random() * 26;
     const tree = makeTree();
     tree.position.set(cx + side * dist, 0, z);
     trees.add(tree);
   }
   scene.add(trees);
 
-  return { index, roadMesh, dashGroup, trees };
+  const bushes = new THREE.Group();
+  const bushCount = Math.ceil(currentMap.treeDensity * 0.6);
+  for (let i = 0; i < bushCount; i++) {
+    const z = zStart + Math.random() * CHUNK_LENGTH;
+    const cx = roadCurveX(z);
+    const side = Math.random() < 0.5 ? -1 : 1;
+    const dist = sideStart + Math.random() * 18;
+    const bush = makeBush();
+    bush.position.set(cx + side * dist, 0, z);
+    bushes.add(bush);
+  }
+  scene.add(bushes);
+
+  const rocks = new THREE.Group();
+  const rockCount = Math.ceil(currentMap.treeDensity * 0.35);
+  for (let i = 0; i < rockCount; i++) {
+    const z = zStart + Math.random() * CHUNK_LENGTH;
+    const cx = roadCurveX(z);
+    const side = Math.random() < 0.5 ? -1 : 1;
+    const dist = sideStart + Math.random() * 22;
+    const rock = makeRock();
+    rock.position.set(cx + side * dist, 0.15, z);
+    rocks.add(rock);
+  }
+  scene.add(rocks);
+
+  return { index, roadMesh, sheen, leftEdge, rightEdge, dashGroup, leftShoulder, rightShoulder, guidePosts, trees, bushes, rocks };
 }
 
 const roadChunks = [];
@@ -163,14 +412,14 @@ function ensureChunks(carZ) {
   }
   while (roadChunks.length && roadChunks[0].index < currentIndex - 3) {
     const old = roadChunks.shift();
-    scene.remove(old.roadMesh, old.dashGroup, old.trees);
+    scene.remove(old.roadMesh, old.sheen, old.leftEdge, old.rightEdge, old.dashGroup, old.leftShoulder, old.rightShoulder, old.guidePosts, old.trees, old.bushes, old.rocks);
   }
 }
 
 function rebuildWorld() {
   while (roadChunks.length) {
     const old = roadChunks.shift();
-    scene.remove(old.roadMesh, old.dashGroup, old.trees);
+    scene.remove(old.roadMesh, old.sheen, old.leftEdge, old.rightEdge, old.dashGroup, old.leftShoulder, old.rightShoulder, old.guidePosts, old.trees, old.bushes, old.rocks);
   }
   ensureChunks(state.z);
 }
@@ -178,6 +427,11 @@ function rebuildWorld() {
 function applyMap(key) {
   currentMap = MAPS[key];
   ground.material.color.set(currentMap.ground);
+  mountainMat.color.set(currentMap.mountainColor);
+  hemi.groundColor.set(currentMap.ground);
+  shoulderMat.color.set(currentMap.shoulder);
+  bushMat.color.set(currentMap.tree);
+  rockMat.color.set(currentMap.rock);
   rebuildWorld();
 }
 
@@ -209,6 +463,28 @@ const wheels = wheelPositions.map(([x, y, z]) => {
   car.add(w);
   return w;
 });
+
+const lampGeo = new THREE.BoxGeometry(0.3, 0.15, 0.05);
+const headlampMat = new THREE.MeshStandardMaterial({ color: 0xfff6df, emissive: 0xfff6df, emissiveIntensity: 1.2 });
+const headlampL = new THREE.Mesh(lampGeo, headlampMat);
+headlampL.position.set(-0.65, 0.65, -1.98);
+const headlampR = headlampL.clone();
+headlampR.position.x = 0.65;
+car.add(headlampL, headlampR);
+
+const tailMat = new THREE.MeshStandardMaterial({ color: 0xff3b3b, emissive: 0xff3b3b, emissiveIntensity: 0.8 });
+const tailL = new THREE.Mesh(lampGeo, tailMat);
+tailL.position.set(-0.65, 0.65, 1.98);
+const tailR = tailL.clone();
+tailR.position.x = 0.65;
+car.add(tailL, tailR);
+
+const headlight = new THREE.SpotLight(0xfff3d0, 0, 45, Math.PI / 6.2, 0.5, 1.3);
+headlight.position.set(0, 0.75, -2.1);
+const headlightTarget = new THREE.Object3D();
+headlightTarget.position.set(0, 0.2, -25);
+car.add(headlight, headlightTarget);
+headlight.target = headlightTarget;
 
 scene.add(car);
 
@@ -322,6 +598,8 @@ function animate() {
   requestAnimationFrame(animate);
   const dt = Math.min(clock.getDelta(), 0.05);
 
+  let targetBank = 0;
+
   if (state.running) {
     const forward = keys["w"] || keys["arrowup"];
     const backward = keys["s"] || keys["arrowdown"];
@@ -329,6 +607,7 @@ function animate() {
     const right = keys["d"] || keys["arrowright"];
     const manualSteer = left || right;
     const manualThrottle = forward || backward;
+    const prevHeading = state.heading;
 
     if (state.autoDrive && (manualSteer || manualThrottle)) {
       setAutoDrive(false);
@@ -370,19 +649,46 @@ function animate() {
     state.z += Math.cos(state.heading) * state.speed * dt;
     state.x += Math.sin(state.heading) * state.speed * dt;
 
+    const headingRate = (state.heading - prevHeading) / dt;
+    targetBank = THREE.MathUtils.clamp(-headingRate * 0.15, -0.3, 0.3);
+
     wheels.forEach((w) => (w.rotation.x -= state.speed * dt * 0.8));
     ensureChunks(state.z);
   }
 
   car.position.set(state.x, 0, state.z);
   car.rotation.y = state.heading;
+  car.rotation.z += (targetBank - car.rotation.z) * Math.min(1, dt * 6);
 
-  const camDist = 9, camHeight = 4;
+  ground.position.set(state.x, 0, state.z);
+  atmosphere.position.set(state.x, 0, state.z);
+  sun.position.set(state.x + SUN_OFFSET.x, SUN_OFFSET.y, state.z + SUN_OFFSET.z);
+  sun.target.position.set(state.x, 0, state.z);
+
+  clouds.forEach((c) => {
+    c.position.x += c.userData.drift * dt;
+    c.position.z += c.userData.drift * 0.6 * dt;
+    const dist = Math.hypot(c.position.x, c.position.z);
+    if (dist > 300) {
+      const angle = Math.atan2(c.position.z, c.position.x) + Math.PI;
+      c.position.set(Math.cos(angle) * 95, c.position.y, Math.sin(angle) * 95);
+    }
+  });
+
+  const speedT = Math.min(1, Math.abs(state.speed) / state.maxSpeed);
+  const camDist = 9 + speedT * 2.5;
+  const camHeight = 4 + speedT * 0.6;
   const offsetX = -Math.sin(state.heading) * camDist;
   const offsetZ = -Math.cos(state.heading) * camDist;
   const camTarget = new THREE.Vector3(state.x + offsetX, camHeight, state.z + offsetZ);
   camera.position.lerp(camTarget, 1 - Math.pow(0.001, dt));
-  camera.lookAt(state.x, 1.2, state.z);
+
+  const lookAheadDist = 3 + speedT * 6;
+  camera.lookAt(state.x + Math.sin(state.heading) * lookAheadDist, 1.2, state.z + Math.cos(state.heading) * lookAheadDist);
+
+  const targetFov = BASE_FOV + speedT * 10;
+  camera.fov += (targetFov - camera.fov) * Math.min(1, dt * 3);
+  camera.updateProjectionMatrix();
 
   document.getElementById("speed-value").textContent = Math.round(Math.abs(state.speed) * 3.2);
 
